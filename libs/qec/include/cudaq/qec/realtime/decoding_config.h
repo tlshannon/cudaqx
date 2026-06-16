@@ -147,6 +147,22 @@ struct sliding_window_config {
   from_heterogeneous_map(const cudaqx::heterogeneous_map &map);
 };
 
+struct nv_fusion_decoder_config {
+  std::optional<std::vector<int32_t>> detector_round;
+  std::optional<std::size_t> num_threads;
+  std::optional<std::size_t> block_leaf_size;
+  std::optional<std::string> fusion_strategy;
+  std::optional<std::vector<double>> error_rate_vec;
+
+  bool operator==(const nv_fusion_decoder_config &) const = default;
+
+  __attribute__((visibility("default"))) cudaqx::heterogeneous_map
+  to_heterogeneous_map() const;
+
+  __attribute__((visibility("default"))) static nv_fusion_decoder_config
+  from_heterogeneous_map(const cudaqx::heterogeneous_map &map);
+};
+
 /// @brief Configuration structure for decoder options.
 struct decoder_config {
   int64_t id = 0;
@@ -158,7 +174,7 @@ struct decoder_config {
   std::vector<std::int64_t> D_sparse;
   std::variant<single_error_lut_config, multi_error_lut_config,
                nv_qldpc_decoder_config, sliding_window_config,
-               trt_decoder_config, pymatching_config>
+               trt_decoder_config, pymatching_config, nv_fusion_decoder_config>
       decoder_custom_args;
 
   bool operator==(const decoder_config &) const = default;
@@ -187,6 +203,10 @@ struct decoder_config {
     } else if (std::holds_alternative<pymatching_config>(decoder_custom_args)) {
       return std::get<pymatching_config>(decoder_custom_args)
           .to_heterogeneous_map();
+    } else if (std::holds_alternative<nv_fusion_decoder_config>(
+                   decoder_custom_args)) {
+      return std::get<nv_fusion_decoder_config>(decoder_custom_args)
+          .to_heterogeneous_map();
     }
     return cudaqx::heterogeneous_map();
   }
@@ -208,6 +228,9 @@ struct decoder_config {
       decoder_custom_args = trt_decoder_config::from_heterogeneous_map(map);
     } else if (type == "pymatching") {
       decoder_custom_args = pymatching_config::from_heterogeneous_map(map);
+    } else if (type == "nv-fusion-decoder") {
+      decoder_custom_args =
+          nv_fusion_decoder_config::from_heterogeneous_map(map);
     }
   }
 

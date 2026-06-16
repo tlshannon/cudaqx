@@ -129,6 +129,32 @@ bool is_nv_qldpc_decoder_available() {
   }
 }
 
+bool is_nv_fusion_decoder_available() {
+  try {
+    std::size_t block_size = 2;
+    std::size_t syndrome_size = 3;
+    cudaqx::tensor<uint8_t> H;
+    std::vector<int32_t> detector_round(syndrome_size, 0);
+    if (syndrome_size >= 2)
+      detector_round[syndrome_size - 1] = 1;
+    cudaqx::heterogeneous_map params;
+    params.insert("detector_round", detector_round);
+    params.insert("block_leaf_size", static_cast<uint64_t>(1));
+    // Graphlike 3x2 PCM (same as NVFusionDecoder.checkRegularEdges).
+    // clang-format off
+    std::vector<uint8_t> H_vec = {1, 0,
+                                  1, 1,
+                                  0, 1};
+    // clang-format on
+    H.copy(H_vec.data(), {syndrome_size, block_size});
+
+    auto d = cudaq::qec::decoder::get("nv-fusion-decoder", H, params);
+    return true;
+  } catch (const std::exception &e) {
+    return false;
+  }
+}
+
 TEST(DecoderYAMLTest, SingleDecoder) {
   if (!is_nv_qldpc_decoder_available()) {
     GTEST_SKIP() << "nv-qldpc-decoder is not available";
@@ -235,6 +261,50 @@ TEST(DecoderYAMLTest, SlidingWindowDecoder) {
 
   multi_config.decoders.push_back(config);
 
+  test_decoder_yaml_roundtrip(multi_config);
+  test_decoder_creation(multi_config);
+}
+
+TEST(DecoderYAMLTest, NVFusionDecoderConfigRoundTrip) {
+  if (!is_nv_fusion_decoder_available()) {
+    GTEST_SKIP() << "nv-fusion-decoder is not available";
+  }
+  cudaq::qec::decoding::config::multi_decoder_config multi_config;
+  cudaq::qec::decoding::config::decoder_config config =
+      create_test_empty_decoder_config(0);
+  config.type = "nv-fusion-decoder";
+  config.block_size = 3;
+  config.syndrome_size = 4;
+  cudaqx::tensor<uint8_t> H;
+  // NV matching validates that each H column is graphlike: one detector
+  // endpoint for a boundary edge or two endpoints for a bulk edge.
+  std::vector<uint8_t> H_vec = {// col 0 connects detectors 0 and 2.
+                                1, 0, 0,
+                                // col 1 connects detectors 1 and 3.
+                                0, 1, 0,
+                                // col 2 is a boundary edge on detector 2.
+                                1, 0, 1, 0, 1, 0};
+  H.copy(H_vec.data(), {config.syndrome_size, config.block_size});
+  cudaqx::tensor<uint8_t> O;
+  std::vector<uint8_t> O_vec = {1, 0, 0};
+  O.copy(O_vec.data(), {1, config.block_size});
+  config.H_sparse = cudaq::qec::pcm_to_sparse_vec(H);
+  config.O_sparse = cudaq::qec::pcm_to_sparse_vec(O);
+  config.D_sparse = cudaq::qec::generate_timelike_sparse_detector_matrix(
+      config.syndrome_size, 2, /*include_first_round=*/false);
+
+  config.decoder_custom_args =
+      cudaq::qec::decoding::config::nv_fusion_decoder_config();
+  auto &nv_fusion_decoder_config =
+      std::get<cudaq::qec::decoding::config::nv_fusion_decoder_config>(
+          config.decoder_custom_args);
+  nv_fusion_decoder_config.detector_round = std::vector<int32_t>{0, 0, 1, 1};
+  nv_fusion_decoder_config.num_threads = 1;
+  nv_fusion_decoder_config.block_leaf_size = 1;
+  nv_fusion_decoder_config.fusion_strategy = "brickwall";
+  nv_fusion_decoder_config.error_rate_vec = std::vector<double>{0.1, 0.1, 0.1};
+
+  multi_config.decoders.push_back(config);
   test_decoder_yaml_roundtrip(multi_config);
   test_decoder_creation(multi_config);
 }

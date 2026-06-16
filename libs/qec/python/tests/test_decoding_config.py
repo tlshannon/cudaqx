@@ -183,6 +183,30 @@ FIELDS_TRT_DECODER = {
     "memory_workspace": (int, 1073741824, 2147483648),  # 1GB, 2GB
 }
 
+# nv_fusion_decoder_config tests
+
+FIELDS_NV_FUSION_DECODER = {
+    "detector_round": (list, [0, 0, 1, 1], [0, 1, 0, 1]),
+    "num_threads": (int, 1, 4),
+    "block_leaf_size": (int, 1, 2),
+    "fusion_strategy": (str, "brickwall", "vertex_cut"),
+    "error_rate_vec": (list, [0.1, 0.1, 0.1], [0.2, 0.05, 0.15]),
+}
+
+
+def is_nv_fusion_decoder_available():
+    try:
+        H = np.array([[1, 0], [1, 1], [0, 1]], dtype=np.uint8)
+        qec.get_decoder(
+            "nv-fusion-decoder",
+            H,
+            detector_round=np.array([0, 0, 1], dtype=np.int32),
+            block_leaf_size=1,
+        )
+        return True
+    except Exception:
+        return False
+
 
 def test_multi_error_lut_config_defaults_are_none():
     m = qec.multi_error_lut_config()
@@ -305,6 +329,78 @@ def test_trt_decoder_config_yaml_roundtrip():
     assert trt2.engine_load_path == "/path/to/engine.trt"
     assert trt2.precision == "fp16"
     assert trt2.memory_workspace == 1073741824
+
+
+def test_nv_fusion_decoder_config_defaults_are_none():
+    nv_fusion = qec.nv_fusion_decoder_config()
+    for name in FIELDS_NV_FUSION_DECODER:
+        assert getattr(nv_fusion,
+                       name) is None, (f"Expected {name} to default to None")
+
+
+@pytest.mark.parametrize("name, meta", list(FIELDS_NV_FUSION_DECODER.items()))
+def test_nv_fusion_decoder_config_set_and_get_each_optional(name, meta):
+    nv_fusion = qec.nv_fusion_decoder_config()
+
+    py_type, sample_val, alt_val = meta
+
+    assert getattr(nv_fusion, name) is None
+
+    setattr(nv_fusion, name, sample_val)
+    got = getattr(nv_fusion, name)
+    if py_type is list:
+        assert isinstance(got, list)
+        if name == "detector_round":
+            assert all(isinstance(x, int) for x in got)
+        else:
+            assert all(isinstance(x, float) for x in got)
+        assert got == sample_val
+    else:
+        assert isinstance(got, py_type)
+        assert got == sample_val
+
+    setattr(nv_fusion, name, alt_val)
+    assert getattr(nv_fusion, name) == alt_val
+
+    setattr(nv_fusion, name, None)
+    assert getattr(nv_fusion, name) is None
+
+
+def test_nv_fusion_decoder_config_yaml_roundtrip():
+    nv_fusion = qec.nv_fusion_decoder_config()
+    nv_fusion.detector_round = [0, 0, 1, 1]
+    nv_fusion.num_threads = 1
+    nv_fusion.block_leaf_size = 1
+    nv_fusion.fusion_strategy = "brickwall"
+    nv_fusion.error_rate_vec = [0.1, 0.1, 0.1]
+
+    dc = qec.decoder_config()
+    dc.id = 0
+    dc.type = "nv-fusion-decoder"
+    dc.block_size = 3
+    dc.syndrome_size = 4
+    dc.H_sparse = [0, -1, 1, -1, 0, 2, -1, 1, -1]
+    dc.O_sparse = [0, -1]
+    dc.D_sparse = qec.generate_timelike_sparse_detector_matrix(
+        dc.syndrome_size, 2, include_first_round=False)
+    dc.set_decoder_custom_args(nv_fusion)
+
+    yaml_text = dc.to_yaml_str()
+    assert isinstance(yaml_text, str) and len(yaml_text) > 0
+
+    dc2 = qec.decoder_config.from_yaml_str(yaml_text)
+    assert dc2 is not None
+    assert dc2.type == "nv-fusion-decoder"
+    assert dc2.block_size == 3
+    assert dc2.syndrome_size == 4
+
+    nv_fusion2 = dc2.decoder_custom_args
+    assert nv_fusion2 is not None
+    assert nv_fusion2.detector_round == [0, 0, 1, 1]
+    assert nv_fusion2.num_threads == 1
+    assert nv_fusion2.block_leaf_size == 1
+    assert nv_fusion2.fusion_strategy == "brickwall"
+    assert nv_fusion2.error_rate_vec == [0.1, 0.1, 0.1]
 
 
 def test_pymatching_config_yaml_roundtrip():

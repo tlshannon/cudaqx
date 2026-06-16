@@ -1,5 +1,5 @@
 # ============================================================================ #
-# Copyright (c) 2022 - 2025 NVIDIA Corporation & Affiliates.                   #
+# Copyright (c) 2022 - 2026 NVIDIA Corporation & Affiliates.                   #
 # All rights reserved.                                                         #
 #                                                                              #
 # This source code and the accompanying materials are made available under     #
@@ -23,6 +23,23 @@ def is_nv_qldpc_decoder_available():
         nv_dec_gpu_and_cpu = qec.get_decoder("nv-qldpc-decoder", H_np)
         return True
     except Exception as e:
+        return False
+
+
+def is_nv_fusion_decoder_available():
+    """
+    Helper function to check if the NV fusion decoder is available.
+    """
+    try:
+        H = np.array([[1, 0], [1, 1], [0, 1]], dtype=np.uint8)
+        qec.get_decoder(
+            "nv-fusion-decoder",
+            H,
+            detector_round=np.array([0, 0, 1], dtype=np.int32),
+            block_leaf_size=1,
+        )
+        return True
+    except Exception:
         return False
 
 
@@ -126,6 +143,48 @@ def create_test_decoder_config_nv_qldpc(decoder_id):
     config.set_decoder_custom_args(nv_config)
 
     return config
+
+
+def create_test_decoder_config_nv_fusion(decoder_id):
+    """
+    Helper function to create a sample test decoder configuration for
+    nv-fusion-decoder.
+    """
+    config = qec.decoder_config()
+    config.id = decoder_id
+    config.type = "nv-fusion-decoder"
+    config.block_size = 3
+    config.syndrome_size = 4
+
+    H = np.array([[1, 0, 0], [0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=np.uint8)
+    O = np.array([[1, 0, 0]], dtype=np.uint8)
+    config.H_sparse = qec.pcm_to_sparse_vec(H)
+    config.O_sparse = qec.pcm_to_sparse_vec(O)
+    config.D_sparse = qec.generate_timelike_sparse_detector_matrix(
+        config.syndrome_size, 2, include_first_round=False)
+
+    nv_fusion_config = qec.nv_fusion_decoder_config()
+    nv_fusion_config.detector_round = [0, 0, 1, 1]
+    nv_fusion_config.num_threads = 1
+    nv_fusion_config.block_leaf_size = 1
+    nv_fusion_config.fusion_strategy = "brickwall"
+    nv_fusion_config.error_rate_vec = [0.1, 0.1, 0.1]
+    config.set_decoder_custom_args(nv_fusion_config)
+    return config
+
+
+def test_nv_fusion_decoder():
+    """
+    Test YAML serialization/deserialization and creation of nv-fusion-decoder.
+    """
+    if not is_nv_fusion_decoder_available():
+        pytest.skip("nv-fusion-decoder plugin is not available")
+    multi_config = qec.multi_decoder_config()
+    config = create_test_decoder_config_nv_fusion(0)
+    multi_config.decoders = [config]
+
+    check_decoder_yaml_roundtrip(multi_config)
+    check_decoder_creation(multi_config)
 
 
 def test_single_decoder():

@@ -296,6 +296,29 @@ sliding_window_config sliding_window_config::from_heterogeneous_map(
   return config;
 }
 
+// ------ nv_fusion_decoder_config ------
+cudaqx::heterogeneous_map
+nv_fusion_decoder_config::to_heterogeneous_map() const {
+  cudaqx::heterogeneous_map config_map;
+  INSERT_ARG(detector_round);
+  INSERT_ARG(num_threads);
+  INSERT_ARG(block_leaf_size);
+  INSERT_ARG(fusion_strategy);
+  INSERT_ARG(error_rate_vec);
+  return config_map;
+}
+
+nv_fusion_decoder_config nv_fusion_decoder_config::from_heterogeneous_map(
+    const cudaqx::heterogeneous_map &map) {
+  nv_fusion_decoder_config config;
+  GET_ARG(detector_round);
+  GET_ARG(num_threads);
+  GET_ARG(block_leaf_size);
+  GET_ARG(fusion_strategy);
+  GET_ARG(error_rate_vec);
+  return config;
+}
+
 #undef INSERT_ARG
 #undef GET_ARG
 
@@ -408,6 +431,19 @@ struct MappingTraits<cudaq::qec::decoding::config::sliding_window_config> {
 };
 
 template <>
+struct MappingTraits<cudaq::qec::decoding::config::nv_fusion_decoder_config> {
+  static void
+  mapping(IO &io,
+          cudaq::qec::decoding::config::nv_fusion_decoder_config &config) {
+    io.mapOptional("detector_round", config.detector_round);
+    io.mapOptional("num_threads", config.num_threads);
+    io.mapOptional("block_leaf_size", config.block_leaf_size);
+    io.mapOptional("fusion_strategy", config.fusion_strategy);
+    io.mapOptional("error_rate_vec", config.error_rate_vec);
+  }
+};
+
+template <>
 struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
   static void mapping(IO &io,
                       cudaq::qec::decoding::config::decoder_config &config) {
@@ -494,6 +530,9 @@ struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
     } else if (config.type == "pymatching") {
       INIT_AND_MAP_DECODER_CUSTOM_ARGS(
           cudaq::qec::decoding::config::pymatching_config);
+    } else if (config.type == "nv-fusion-decoder") {
+      INIT_AND_MAP_DECODER_CUSTOM_ARGS(
+          cudaq::qec::decoding::config::nv_fusion_decoder_config);
     }
   }
 };

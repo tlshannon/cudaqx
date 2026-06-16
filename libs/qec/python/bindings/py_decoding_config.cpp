@@ -201,6 +201,29 @@ void bindDecodingConfig(nb::module_ &mod) {
                   &sliding_window_config::from_heterogeneous_map,
                   nb::arg("map"));
 
+  // nv_fusion_decoder_config
+  nb::class_<config::nv_fusion_decoder_config>(
+      mod_cfg, "nv_fusion_decoder_config", "NV fusion decoder configuration.")
+      .def(nb::init<>())
+      .def(
+          "__init__",
+          [](config::nv_fusion_decoder_config &self,
+             const cudaqx::heterogeneous_map &map) {
+            new (&self) nv_fusion_decoder_config(
+                nv_fusion_decoder_config::from_heterogeneous_map(map));
+          },
+          nb::arg("map"))
+      .def_rw("detector_round", &nv_fusion_decoder_config::detector_round)
+      .def_rw("num_threads", &nv_fusion_decoder_config::num_threads)
+      .def_rw("block_leaf_size", &nv_fusion_decoder_config::block_leaf_size)
+      .def_rw("fusion_strategy", &nv_fusion_decoder_config::fusion_strategy)
+      .def_rw("error_rate_vec", &nv_fusion_decoder_config::error_rate_vec)
+      .def("to_heterogeneous_map",
+           &nv_fusion_decoder_config::to_heterogeneous_map, nb::rv_policy::move)
+      .def_static("from_heterogeneous_map",
+                  &nv_fusion_decoder_config::from_heterogeneous_map,
+                  nb::arg("map"));
+
   // decoder_config
   nb::class_<config::decoder_config>(mod_cfg, "decoder_config")
       .def(nb::init<>())
