@@ -464,19 +464,28 @@ struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
     io.mapOptional("dispatch", config.dispatch,
                    cudaq::qec::decoding::config::DecoderDispatch::host);
     io.mapOptional("cuda_device_id", config.cuda_device_id);
-    // The DEM arrives in one of two forms (see decoder_config). Everything
-    // below the mapping calls enforces that exactly one of them is described,
-    // because the chunk form derives the flat fields and a config that spelled
-    // out both could disagree with itself.
-    // A flat configuration names all five on the way out as well as the way
-    // in. Emitting only the ones that differ from their defaults would drop a
-    // legitimately empty O_sparse (a DEM with no observables) and leave behind
-    // a document that no longer parses. A chunk-form configuration takes the
-    // optional path so its derived fields stay absent, which is what makes the
-    // emitted document re-parse as chunk form.
+    // The DEM arrives in one of three forms (see decoder_config): a Stim DEM
+    // path, a flat matrix encoding, or dem_chunks. Everything below the
+    // mapping calls enforces that exactly one of them is described, because
+    // the chunk form derives the flat fields and a config that spelled out
+    // both could disagree with itself; stim_dem_path is likewise mutually
+    // exclusive with the matrix keys.
+    //
+    // A flat configuration names all five matrix fields on the way out as
+    // well as the way in. Emitting only the ones that differ from their
+    // defaults would drop a legitimately empty O_sparse (a DEM with no
+    // observables) and leave behind a document that no longer parses. A
+    // chunk-form or Stim-DEM configuration takes the optional path so its
+    // derived/unused fields stay absent, which is what makes the emitted
+    // document re-parse as the same form.
+    io.mapOptional("stim_dem_path", config.stim_dem_path, std::string{});
+    const bool emitting_chunk_form = io.outputting() &&
+                                     config.dem_chunks.has_value() &&
+                                     config.H_sparse.empty();
+    const bool emitting_stim_form =
+        io.outputting() && !config.stim_dem_path.empty();
     const bool emitting_flat_form =
-        io.outputting() &&
-        !(config.dem_chunks.has_value() && config.H_sparse.empty());
+        io.outputting() && !emitting_chunk_form && !emitting_stim_form;
     if (emitting_flat_form) {
       io.mapRequired("block_size", config.block_size);
       io.mapRequired("syndrome_size", config.syndrome_size);
@@ -491,6 +500,7 @@ struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
       io.mapOptional("D_sparse", config.D_sparse, std::vector<std::int64_t>{});
     }
     io.mapOptional("dem_chunks", config.dem_chunks);
+    io.mapOptional("error_rate_vec", config.error_rate_vec);
 
     // LLVM's YAML parser records a diagnostic and keeps going, so a malformed
     // document arrives here half-populated. Validate state only if error-free.
@@ -502,11 +512,17 @@ struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
     // expand_dem_chunks() leaves behind after it runs.
     const bool chunk_form =
         config.dem_chunks.has_value() && config.H_sparse.empty();
+    const bool stim_form = !config.stim_dem_path.empty();
 
-    // Both forms at once is legal but lopsided: H_sparse wins and the chunk
-    // spec never runs. expand_dem_chunks() produces exactly this state, so it
-    // cannot be an error, but a hand-written document that reaches it has lost
-    // its dem_chunks without any other signal.
+    if (!io.outputting() && stim_form && chunk_form)
+      throw std::runtime_error(
+          "stim_dem_path is mutually exclusive with dem_chunks for decoder " +
+          std::to_string(config.id) + "; supply exactly one model source");
+
+    // Both flat and chunk forms at once is legal but lopsided: H_sparse wins
+    // and the chunk spec never runs. expand_dem_chunks() produces exactly this
+    // state, so it cannot be an error, but a hand-written document that reaches
+    // it has lost its dem_chunks without any other signal.
     if (!io.outputting() && config.dem_chunks.has_value() &&
         !config.H_sparse.empty())
       CUDA_QEC_WARN(
@@ -538,11 +554,21 @@ struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
       reject_derived("syndrome_size", config.syndrome_size != 0);
       reject_derived("O_sparse", !config.O_sparse.empty());
       reject_derived("D_sparse", !config.D_sparse.empty());
+      reject_derived("error_rate_vec", !config.error_rate_vec.empty());
+    } else if (stim_form) {
+      // Matrix keys compete with the DEM; resolve_decoder_init() enforces that.
+      // D_sparse is orthogonal and required for both Stim and matrix sources.
+      if (!io.outputting() && !in_document("D_sparse"))
+        throw std::runtime_error(
+            "decoder " + std::to_string(config.id) +
+            " is missing required field(s): D_sparse. A Stim DEM configuration "
+            "names stim_dem_path and D_sparse together.");
     } else {
       // A flat document spells out its whole DEM, so every one of these fields
-      // has to be there. They are mapOptional only because the chunk form
-      // derives them; without this check a document that omits one parses into
-      // a zero-sized DEM and fails much later, at decoder construction.
+      // has to be there. They are mapOptional only because the chunk and Stim
+      // forms derive or omit them; without this check a document that omits one
+      // parses into a zero-sized DEM and fails much later, at decoder
+      // construction.
       if (!io.outputting()) {
         std::string missing;
         for (const char *name : {"block_size", "syndrome_size", "H_sparse",
@@ -559,14 +585,14 @@ struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
               " is missing required field(s): " + missing +
               ". A flat DEM names block_size, syndrome_size, H_sparse, "
               "O_sparse and D_sparse together; use dem_chunks "
-              "to describe the same DEM one round at a time instead.");
+              "to describe the same DEM one round at a time, or stim_dem_path "
+              "for a Stim DEM file, instead.");
       } // end - if(!io.outputting())
 
       if (config.H_sparse.empty() && config.syndrome_size > 0)
         throw std::runtime_error(
             "H_sparse is required for decoder " + std::to_string(config.id) +
-            " unless dem_chunks is present, which describes the same DEM one "
-            "round at a time instead.");
+            " unless dem_chunks or stim_dem_path is present.");
       if (config.block_size == 0 && !config.H_sparse.empty())
         throw std::runtime_error("block_size is required for decoder " +
                                  std::to_string(config.id));
@@ -583,40 +609,45 @@ struct MappingTraits<cudaq::qec::decoding::config::decoder_config> {
       }
     }
 
-    // Validate that no values in the H_sparse vector are out of range.
-    for (auto value : config.H_sparse) {
-      if (value < -1 || (value >= 0 && value >= config.block_size)) {
-        throw std::runtime_error("Value in H_sparse vector is out of range: " +
-                                 std::to_string(value));
+    // Stim DEM dimensions are derived later; skip matrix-shape checks here.
+    if (!stim_form) {
+      // Validate that no values in the H_sparse vector are out of range.
+      for (auto value : config.H_sparse) {
+        if (value < -1 || (value >= 0 && value >= config.block_size)) {
+          throw std::runtime_error(
+              "Value in H_sparse vector is out of range: " +
+              std::to_string(value));
+        }
       }
-    }
 
-    // Validate that no values in the O_sparse vector are out of range.
-    for (auto value : config.O_sparse) {
-      if (value < -1 || (value >= 0 && value >= config.block_size)) {
-        throw std::runtime_error("Value in O_sparse vector is out of range: " +
-                                 std::to_string(value));
+      // Validate that no values in the O_sparse vector are out of range.
+      for (auto value : config.O_sparse) {
+        if (value < -1 || (value >= 0 && value >= config.block_size)) {
+          throw std::runtime_error(
+              "Value in O_sparse vector is out of range: " +
+              std::to_string(value));
+        }
       }
-    }
 
-    // Validate that if the D_sparse is provided, it is a valid D matrix. That
-    // means that the number of rows in the D_sparse matrix should be equal to
-    // the number of rows in the H_sparse matrix, and no row should be empty.
-    if (!config.D_sparse.empty()) {
-      auto num_D_rows =
-          std::count(config.D_sparse.begin(), config.D_sparse.end(), -1);
-      if (num_D_rows != config.syndrome_size) {
-        throw std::runtime_error("Number of rows in D_sparse vector is not "
-                                 "equal to syndrome_size: " +
-                                 std::to_string(num_D_rows) +
-                                 " != " + std::to_string(config.syndrome_size));
-      }
-      // No row should be empty, which means that there should be no
-      // back-to-back -1 values.
-      for (std::size_t i = 0; i < config.D_sparse.size() - 1; ++i) {
-        if (config.D_sparse.at(i) == -1 && config.D_sparse.at(i + 1) == -1) {
-          throw std::runtime_error("D_sparse row is empty for decoder " +
-                                   std::to_string(config.id));
+      // Validate that if the D_sparse is provided, it is a valid D matrix. That
+      // means that the number of rows in the D_sparse matrix should be equal to
+      // the number of rows in the H_sparse matrix, and no row should be empty.
+      if (!config.D_sparse.empty()) {
+        auto num_D_rows =
+            std::count(config.D_sparse.begin(), config.D_sparse.end(), -1);
+        if (num_D_rows != config.syndrome_size) {
+          throw std::runtime_error("Number of rows in D_sparse vector is not "
+                                   "equal to syndrome_size: " +
+                                   std::to_string(num_D_rows) + " != " +
+                                   std::to_string(config.syndrome_size));
+        }
+        // No row should be empty, which means that there should be no
+        // back-to-back -1 values.
+        for (std::size_t i = 0; i < config.D_sparse.size() - 1; ++i) {
+          if (config.D_sparse.at(i) == -1 && config.D_sparse.at(i + 1) == -1) {
+            throw std::runtime_error("D_sparse row is empty for decoder " +
+                                     std::to_string(config.id));
+          }
         }
       }
     }
@@ -912,6 +943,7 @@ std::string decoder_config_json_schema() {
        llvm::json::Object{{"enum", llvm::json::Array{"host", "device_graph"}}}},
       {"cuda_device_id",
        llvm::json::Object{{"type", "integer"}, {"minimum", 0}}},
+      {"stim_dem_path", llvm::json::Object{{"type", "string"}}},
       {"block_size", llvm::json::Object{{"type", "integer"}, {"minimum", 0}}},
       {"syndrome_size",
        llvm::json::Object{{"type", "integer"}, {"minimum", 0}}},
@@ -919,6 +951,9 @@ std::string decoder_config_json_schema() {
       {"O_sparse", llvm::json::Object{{"$ref", "#/$defs/sparse_matrix"}}},
       {"D_sparse", llvm::json::Object{{"$ref", "#/$defs/sparse_matrix"}}},
       {"dem_chunks", llvm::json::Object{{"$ref", "#/$defs/dem_chunks"}}},
+      {"error_rate_vec",
+       llvm::json::Object{{"type", "array"},
+                          {"items", llvm::json::Object{{"type", "number"}}}}},
       {"decoder_custom_args", llvm::json::Object{{"type", "object"}}},
   };
 
@@ -1028,17 +1063,58 @@ std::string decoder_config_json_schema() {
            {"type", "object"},
            {"properties", std::move(config_properties)},
            {"required", llvm::json::Array{"id", "type"}},
-           // The DEM is described either flat or as repeated phases. The
-           // parser additionally rejects a chunk-form document that also sets
-           // the derived fields, which is not expressible here.
-           {"anyOf",
+           // Exactly one model source. Matrix and Stim DEM both require
+           // D_sparse; dem_chunks derives it. An expanded flat+dem_chunks
+           // document matches the matrix branch (H_sparse present), so the
+           // dem_chunks-only branch forbids H_sparse.
+           {"oneOf",
             llvm::json::Array{
                 llvm::json::Object{
-                    {"required", llvm::json::Array{"H_sparse", "block_size",
-                                                   "syndrome_size", "O_sparse",
-                                                   "D_sparse"}}},
+                    {"required",
+                     llvm::json::Array{"block_size", "syndrome_size",
+                                       "H_sparse", "O_sparse", "D_sparse"}},
+                    // Runtime selects the DEM source on a NON-EMPTY path, so
+                    // an explicitly empty one is still a matrix configuration.
+                    {"properties",
+                     llvm::json::Object{
+                         {"stim_dem_path",
+                          llvm::json::Object{{"maxLength", 0}}}}}},
                 llvm::json::Object{
-                    {"required", llvm::json::Array{"dem_chunks"}}}}},
+                    {"required",
+                     llvm::json::Array{"stim_dem_path", "D_sparse"}},
+                    {"properties", llvm::json::Object{{"stim_dem_path",
+                                                       llvm::json::Object{
+                                                           {"minLength", 1}}}}},
+                    {"allOf",
+                     llvm::json::Array{
+                         llvm::json::Object{
+                             {"not", llvm::json::Object{{"required",
+                                                         llvm::json::Array{
+                                                             "H_sparse"}}}}},
+                         llvm::json::Object{
+                             {"not", llvm::json::Object{{"required",
+                                                         llvm::json::Array{
+                                                             "O_sparse"}}}}},
+                         llvm::json::Object{
+                             {"not",
+                              llvm::json::Object{
+                                  {"required",
+                                   llvm::json::Array{"error_rate_vec"}}}}},
+                         llvm::json::Object{
+                             {"not",
+                              llvm::json::Object{
+                                  {"required",
+                                   llvm::json::Array{"dem_chunks"}}}}}}}},
+                llvm::json::Object{
+                    {"required", llvm::json::Array{"dem_chunks"}},
+                    {"properties", llvm::json::Object{{"stim_dem_path",
+                                                       llvm::json::Object{
+                                                           {"maxLength", 0}}}}},
+                    {"allOf",
+                     llvm::json::Array{llvm::json::Object{
+                         {"not", llvm::json::Object{{"required",
+                                                     llvm::json::Array{
+                                                         "H_sparse"}}}}}}}}}},
            {"additionalProperties", false},
            {"allOf", std::move(dispatch)}}},
       {"decoder_params", std::move(decoder_params)},
@@ -1086,20 +1162,33 @@ std::string decoder_config_json_schema() {
 static std::mutex g_last_multi_decoder_config_mutex;
 static std::shared_ptr<const multi_decoder_config> g_last_multi_decoder_config;
 
-int configure_decoders(multi_decoder_config &config) {
+int configure_decoders(multi_decoder_config &config,
+                       const std::filesystem::path &base_dir) {
   CUDA_QEC_INFO("Initializing realtime decoding library with config object");
+  const int status =
+      cudaq::qec::decoding::host::configure_decoders(config, base_dir);
+  if (status != 0)
+    return status;
+
+  // Stash and publish only once the configuration is actually in effect, so a
+  // failed application cannot leave a configuration cached here or advertised
+  // to remote targets that nothing is honoring.
   {
     std::lock_guard<std::mutex> lock(g_last_multi_decoder_config_mutex);
     g_last_multi_decoder_config =
         std::make_shared<const multi_decoder_config>(config);
   }
-  // Publish the decoder configuration so CUDA-Q can inject it into
-  // remote-target job requests. The cudaq integration (ExtraPayloadProvider) is
-  // installed by cudaq-qec at load time; this call is a no-op when cudaq-qec is
-  // not loaded, keeping this library free of any direct cudaq-common
-  // dependency.
+  // The cudaq integration (ExtraPayloadProvider) is installed by cudaq-qec at
+  // load time; this call is a no-op when cudaq-qec is not loaded, keeping this
+  // library free of any direct cudaq-common dependency.
   cudaq::qec::publish_decoder_config_payload(config.to_yaml_str());
-  return cudaq::qec::decoding::host::configure_decoders(config);
+  return status;
+}
+
+int configure_decoders(multi_decoder_config &config) {
+  // No originating file: relative model paths resolve against the working
+  // directory as it stands when resolution starts.
+  return configure_decoders(config, std::filesystem::current_path());
 }
 
 std::shared_ptr<const multi_decoder_config>
@@ -1146,7 +1235,10 @@ int configure_decoders_from_file(const char *config_file) {
                            std::istreambuf_iterator<char>());
   log_config(config_str.c_str(), /*from_file=*/true);
   auto config = multi_decoder_config::from_yaml_str(config_str);
-  return configure_decoders(config);
+  // Relative model paths resolve against the configuration file's directory,
+  // absolute so the resolved paths stay valid if the working directory moves.
+  return configure_decoders(
+      config, std::filesystem::absolute(config_file_str).parent_path());
 }
 
 int configure_decoders_from_str(const char *config_str) {

@@ -11,6 +11,7 @@
 #include "cuda-qx/core/heterogeneous_map.h"
 #include "cudaq/qec/extended_dem.h"
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -71,8 +72,15 @@ struct decoder_config {
   /// GPU-accelerated decoder, hence at this level rather than inside the
   /// per-decoder custom args. Unset = unpinned.
   std::optional<int> cuda_device_id;
-  /// The five fields below describe the DEM two alternative ways, and exactly
-  /// one of them applies:
+  /// Path to a Stim detector error model, authoritative when set. Resolved
+  /// against the configuration file's directory, or the process working
+  /// directory for a programmatic or raw-string configuration. Mutually
+  /// exclusive with `H_sparse`, `O_sparse`, `error_rate_vec` and `dem_chunks`,
+  /// which are competing representations of the same model; `block_size` and
+  /// `syndrome_size` remain accepted as checked assertions.
+  std::string stim_dem_path;
+  /// The matrix and chunk fields below describe the DEM two alternative ways
+  /// when `stim_dem_path` is unset, and exactly one of them applies:
   ///
   ///   - Flat form: H_sparse plus block_size, syndrome_size, O_sparse and
   ///     D_sparse, all sized for the whole experiment.
@@ -82,10 +90,14 @@ struct decoder_config {
   ///
   /// See expand_dem_chunks() for the derivation, which runs at decoder
   /// construction so the rest of the pipeline only ever sees the flat form.
+  /// Required for a matrix model; derived from a Stim DEM or dem_chunks
+  /// otherwise. Zero means unset.
   uint64_t block_size = 0;
   uint64_t syndrome_size = 0;
   std::vector<std::int64_t> H_sparse;
   std::vector<std::int64_t> O_sparse;
+  /// Maps raw measurements to detectors. Required for Stim DEM and matrix
+  /// sources; derived from dem_chunks for the chunk form.
   std::vector<std::int64_t> D_sparse;
   /// Optional per-phase DEM for a streaming, repeated-round decomposition.
   /// H_sparse above describes the whole experiment as one flat matrix; these
@@ -98,6 +110,8 @@ struct decoder_config {
   /// H_sparse.empty(). Nonempty H_sparse is exactly the state
   /// expand_dem_chunks() leaves behind, allowing round-trip through YAML.
   std::optional<cudaq::qec::dem_chunks_spec> dem_chunks;
+  /// Error probability per H column.
+  std::vector<double> error_rate_vec;
   decoder_custom_args_t decoder_custom_args;
 
   bool operator==(const decoder_config &) const = default;
@@ -222,6 +236,14 @@ __attribute__((visibility("default"))) std::string decoder_config_json_schema();
 /// @return 0 on success, non-zero on failure.
 __attribute__((visibility("default"))) int
 configure_decoders(multi_decoder_config &config);
+
+/// @brief Configure the decoders, resolving relative model paths (such as
+/// `stim_dem_path`) against @p base_dir. The overload above uses the process
+/// working directory as it stands when resolution starts.
+/// @return 0 on success, non-zero on failure.
+__attribute__((visibility("default"))) int
+configure_decoders(multi_decoder_config &config,
+                   const std::filesystem::path &base_dir);
 
 /// @brief Configure the decoders from a file. This function configures both
 /// local decoders, and if running on remote target hardware, will submit the
