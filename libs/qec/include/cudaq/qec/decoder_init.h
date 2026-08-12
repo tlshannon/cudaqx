@@ -20,17 +20,21 @@
 
 namespace cudaq::qec {
 
+/// Declared rather than included: `decoder.h` includes this header, so
+/// including extended_dem.h would widen the include graph of every plugin.
+struct dem_chunks_spec;
+struct extended_dem;
+
 /// @brief Authoritative representation from which a decoder model originates.
 ///
-/// Matrix and Stim sources are implemented. This is the entry point for a
-/// compact chunked DEM: that source would be added here with a new enumerator
-/// plus its typed constructor and accessor, so a decoder that consumes chunks
-/// reads them directly instead of the handle first flattening them into
-/// matrices. Adding one changes neither the `decoder_init` object layout nor
-/// the decoder factory signature.
+/// Each source names what the model is; the matrix accessors expose a
+/// projection of it. A decoder that understands a source reads it directly
+/// (`stim_dem()`, `dem_chunks()`). Adding one changes neither the object
+/// layout nor the decoder factory signature.
 enum class decoder_model_source : std::uint8_t {
   matrices,
   stim_dem,
+  dem_chunks,
 };
 
 /// @brief Stable, owning input contract shared by offline and server decoders.
@@ -82,6 +86,35 @@ public:
   from_stim_dem(std::string stim_dem_text,
                 std::optional<sparse_binary_matrix> measurement_to_detectors =
                     std::nullopt);
+
+  /// @brief Construct from an authoritative chunked DEM.
+  ///
+  /// The spec is retained, so a decoder that consumes rounds reads the phases
+  /// through `dem_chunks()`; matrix accessors expose their projection.
+  ///
+  /// D is a parameter because deriving it means picking a detector convention
+  /// (`dem_chunks_to_d_sparse()` encodes the memory experiment's), which is a
+  /// property of the circuit rather than of the model.
+  ///
+  /// Phases declaring no observable rows produce a handle with no observable
+  /// model, exactly as an H-only matrix input does.
+  ///
+  /// @throws std::invalid_argument if the spec is inconsistent or its round
+  ///         count unresolvable.
+  static decoder_init
+  from_dem_chunks(dem_chunks_spec spec,
+                  std::optional<sparse_binary_matrix> measurement_to_detectors =
+                      std::nullopt);
+
+  /// @brief Overload for a caller holding the already-expanded sequence.
+  ///
+  /// Deriving D requires that expansion, so passing it avoids a second O(T)
+  /// pass. The chunks must be the expansion of @p spec; their count is checked
+  /// against it, but their contents are taken on trust.
+  static decoder_init
+  from_dem_chunks(dem_chunks_spec spec, std::vector<extended_dem> chunks,
+                  std::optional<sparse_binary_matrix> measurement_to_detectors =
+                      std::nullopt);
 
   decoder_init(const decoder_init &) noexcept;
   /// @brief Move construction leaves the source valid only for destruction or
@@ -137,6 +170,20 @@ public:
   /// @throws std::logic_error if the authoritative source is not a Stim DEM.
   const std::string &stim_dem() const;
 
+  bool has_dem_chunks() const noexcept;
+
+  /// @brief The authoritative spec: phases, connections, seam, round count.
+  /// @throws std::logic_error if the authoritative source is not chunked.
+  const dem_chunks_spec &dem_chunks() const;
+
+  /// @brief The expansion the projection was built from, in round order, or
+  /// nullptr when the handle retains none.
+  ///
+  /// Non-null whenever `has_dem_chunks()` holds today, since
+  /// `from_dem_chunks()` rejects an unresolvable round count. The nullptr case
+  /// leaves room for a streaming source without changing this API.
+  const std::vector<extended_dem> *dem_chunk_sequence() const noexcept;
+
   /// Dimensions are stored as source metadata so these accessors never need to
   /// request H or O. For matrix sources they intentionally duplicate the O(1)
   /// matrix shape values in preparation for compact source alternatives.
@@ -146,13 +193,19 @@ public:
 
 private:
   struct impl;
-  static std::shared_ptr<const impl> make_matrix_state(
+  /// Mutable so a source-specific factory can attach its own data instead of
+  /// this growing a parameter per source.
+  static std::shared_ptr<impl> make_matrix_state(
       decoder_model_source source, sparse_binary_matrix detector_error_matrix,
       std::optional<sparse_binary_matrix> observable_flips_matrix,
       std::vector<double> error_rates,
       std::optional<std::vector<std::size_t>> error_ids,
       std::optional<sparse_binary_matrix> measurement_to_detectors,
       std::optional<std::string> raw_stim_dem = std::nullopt);
+  /// Project the sequence to sparse H, O and rates, retaining it and the spec.
+  static std::shared_ptr<impl> make_chunk_state(
+      dem_chunks_spec spec, std::vector<extended_dem> chunks,
+      std::optional<sparse_binary_matrix> measurement_to_detectors);
   explicit decoder_init(std::shared_ptr<const impl> state);
   std::shared_ptr<const impl> state_;
 };

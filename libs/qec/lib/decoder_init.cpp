@@ -8,6 +8,7 @@
 
 #include "cudaq/qec/decoder_init.h"
 #include "sparse_dem_from_stim_text.h"
+#include "cudaq/qec/extended_dem.h"
 #include <stdexcept>
 #include <utility>
 
@@ -26,6 +27,10 @@ struct decoder_init::impl {
   std::optional<std::vector<std::size_t>> ids;
   std::optional<sparse_binary_matrix> D;
   std::optional<std::string> raw_stim_dem;
+  std::optional<dem_chunks_spec> chunk_spec;
+  /// The expansion the projection was built from. Shared because the state is
+  /// immutable, so an impl copy need not duplicate every round's matrices.
+  std::shared_ptr<const std::vector<extended_dem>> chunks;
 };
 
 namespace {
@@ -49,9 +54,20 @@ void validate_model(const sparse_binary_matrix &H,
         "decoder_init: D row count must match H row count");
 }
 
+/// A repeating phase emits one copy per round, so a streaming spec has no
+/// definite sequence. Rejected rather than deferred: without an expansion there
+/// is no matrix projection, and the decoder base sizes its buffers from that.
+/// Checked ahead of phase_sequence(), which would fail less clearly.
+void require_resolvable_round_count(const dem_chunks_spec &spec) {
+  if (spec.has_repeating_phase() && !spec.num_rounds.has_value())
+    throw std::invalid_argument(
+        "decoder_init: cannot expand dem_chunks with a repeating phase and no "
+        "num_rounds; the round count has to be known to build a decoder");
+}
+
 } // namespace
 
-std::shared_ptr<const decoder_init::impl> decoder_init::make_matrix_state(
+std::shared_ptr<decoder_init::impl> decoder_init::make_matrix_state(
     decoder_model_source source, sparse_binary_matrix H,
     std::optional<sparse_binary_matrix> O, std::vector<double> rates,
     std::optional<std::vector<std::size_t>> ids,
@@ -75,6 +91,59 @@ std::shared_ptr<const decoder_init::impl> decoder_init::make_matrix_state(
   state->ids = std::move(ids);
   state->D = std::move(D);
   state->raw_stim_dem = std::move(raw_stim_dem);
+  return state;
+}
+
+std::shared_ptr<decoder_init::impl> decoder_init::make_chunk_state(
+    dem_chunks_spec spec, std::vector<extended_dem> chunks,
+    std::optional<sparse_binary_matrix> measurement_to_detectors) {
+  if (chunks.empty())
+    throw std::invalid_argument("decoder_init: dem_chunks expanded to no "
+                                "chunks, so it describes no model");
+
+  // A supplied expansion has to be the one the spec describes, or the retained
+  // spec would name a different model than the projection. Comparing lengths
+  // catches the likely misuse: an expansion of a different round count.
+  require_resolvable_round_count(spec);
+  const auto sequence = spec.phase_sequence();
+  if (sequence.size() != chunks.size())
+    throw std::invalid_argument("decoder_init: dem_chunks spec describes " +
+                                std::to_string(sequence.size()) +
+                                " chunks but " + std::to_string(chunks.size()) +
+                                " were supplied");
+
+  // Project straight to sparse, as from_stim_dem() does: closing the chunks
+  // would allocate a dense detector x fault tensor for a model whose sparse
+  // form is a small fraction of it.
+  auto H = dem_chunks_to_pcm(chunks, spec.seam.from_seam, spec.seam.to_seam);
+  const auto observable_rows = dem_chunks_to_o_sparse(chunks);
+  // Phases with no observable rows supply no mapping, like an H-only matrix
+  // input. A synthesized zero-row O would report one, letting a decoder built
+  // for observable output construct and then return an empty frame.
+  std::optional<sparse_binary_matrix> O;
+  if (!observable_rows.empty())
+    O = sparse_binary_matrix::from_nested_csr(
+        static_cast<sparse_binary_matrix::index_type>(observable_rows.size()),
+        H.num_cols(), observable_rows);
+
+  // Both projections lay fault columns out in chunk order, so the priors
+  // concatenate in the same basis.
+  std::size_t num_rates = 0;
+  for (const auto &chunk : chunks)
+    num_rates += chunk.error_rates.size();
+  std::vector<double> error_rates;
+  error_rates.reserve(num_rates);
+  for (const auto &chunk : chunks)
+    error_rates.insert(error_rates.end(), chunk.error_rates.begin(),
+                       chunk.error_rates.end());
+
+  auto state =
+      make_matrix_state(decoder_model_source::dem_chunks, std::move(H),
+                        std::move(O), std::move(error_rates), std::nullopt,
+                        std::move(measurement_to_detectors));
+  state->chunk_spec = std::move(spec);
+  state->chunks =
+      std::make_shared<const std::vector<extended_dem>>(std::move(chunks));
   return state;
 }
 
@@ -115,6 +184,22 @@ decoder_init decoder_init::from_stim_dem(
       decoder_model_source::stim_dem, std::move(H), std::move(O),
       std::move(error_rates), std::nullopt, std::move(measurement_to_detectors),
       std::move(stim_dem_text)));
+}
+
+decoder_init decoder_init::from_dem_chunks(
+    dem_chunks_spec spec,
+    std::optional<sparse_binary_matrix> measurement_to_detectors) {
+  require_resolvable_round_count(spec);
+  auto chunks = dem_chunks_from_spec(spec);
+  return from_dem_chunks(std::move(spec), std::move(chunks),
+                         std::move(measurement_to_detectors));
+}
+
+decoder_init decoder_init::from_dem_chunks(
+    dem_chunks_spec spec, std::vector<extended_dem> chunks,
+    std::optional<sparse_binary_matrix> measurement_to_detectors) {
+  return decoder_init(make_chunk_state(std::move(spec), std::move(chunks),
+                                       std::move(measurement_to_detectors)));
 }
 
 decoder_init::decoder_init(std::shared_ptr<const impl> state)
@@ -158,10 +243,12 @@ decoder_init::measurement_to_detectors() const noexcept {
 }
 
 decoder_init decoder_init::canonicalize_H() const {
-  auto H = state_->H.canonicalize().to_csc();
-  return decoder_init(make_matrix_state(state_->source, std::move(H), state_->O,
-                                        state_->rates, state_->ids, state_->D,
-                                        state_->raw_stim_dem));
+  // Copy and replace H rather than rebuild: canonicalization leaves every
+  // dimension and source-specific field untouched, so a later source cannot
+  // be dropped here by omission.
+  auto state = std::make_shared<impl>(*state_);
+  state->H = state_->H.canonicalize().to_csc();
+  return decoder_init(std::move(state));
 }
 
 decoder_init decoder_init::decoder_init_without_d() const {
@@ -179,6 +266,22 @@ const std::string &decoder_init::stim_dem() const {
     throw std::logic_error(
         "decoder_init: authoritative source is not a Stim DEM");
   return *state_->raw_stim_dem;
+}
+
+bool decoder_init::has_dem_chunks() const noexcept {
+  return state_->chunk_spec.has_value();
+}
+
+const dem_chunks_spec &decoder_init::dem_chunks() const {
+  if (!state_->chunk_spec)
+    throw std::logic_error(
+        "decoder_init: authoritative source is not a chunked DEM");
+  return *state_->chunk_spec;
+}
+
+const std::vector<extended_dem> *
+decoder_init::dem_chunk_sequence() const noexcept {
+  return state_->chunks.get();
 }
 
 std::size_t decoder_init::num_detectors() const noexcept {

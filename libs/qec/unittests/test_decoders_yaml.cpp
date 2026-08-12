@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -2137,6 +2138,134 @@ TEST(DecoderChunkFormTest, ExpandsToASelfConsistentFlatConfig) {
   // Expanded config is flat, so re-expanding is a no-op.
   EXPECT_FALSE(
       cudaq::qec::decoding::config::expand_dem_chunks(config).has_value());
+}
+
+TEST(DecoderChunkFormTest, ResolvesToAChunkSourcedHandle) {
+  const auto config = parse_one(dem_chunks_yaml(5));
+  const auto inputs = cudaq::qec::decoding::host::resolve_decoder_init(
+      config, std::filesystem::current_path());
+
+  // Resolution hands the phases to the decoder instead of flattening them
+  // away on the way past.
+  EXPECT_EQ(inputs.source(), cudaq::qec::decoder_model_source::dem_chunks);
+  ASSERT_TRUE(inputs.has_dem_chunks());
+  EXPECT_TRUE(inputs.dem_chunks() == *config.dem_chunks);
+  ASSERT_NE(inputs.dem_chunk_sequence(), nullptr);
+  EXPECT_EQ(inputs.dem_chunk_sequence()->size(), 5u);
+
+  // The same sizes the flattening path derived, plus D, whose memory-
+  // experiment detector convention the config layer still owns.
+  EXPECT_EQ(inputs.num_detectors(), 5u);
+  EXPECT_EQ(inputs.num_error_mechanisms(), 10u);
+  EXPECT_EQ(inputs.num_observables(), 1u);
+  ASSERT_NE(inputs.measurement_to_detectors(), nullptr);
+  EXPECT_EQ(inputs.measurement_to_detectors()->num_rows(), 5u);
+}
+
+TEST(DecoderChunkFormTest, ResolveRejectsChunksThatFlipNoObservable) {
+  // The realtime path returns observable corrections, so a model with no
+  // mapping cannot serve it; without this it decodes to a zero-length frame.
+  auto config = parse_one(dem_chunks_yaml(5));
+  ASSERT_TRUE(config.dem_chunks.has_value());
+  for (auto &phase : config.dem_chunks->phases)
+    phase.spec.O_sparse.clear();
+
+  try {
+    cudaq::qec::decoding::host::resolve_decoder_init(
+        config, std::filesystem::current_path());
+    FAIL() << "expected a missing-observable rejection";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string(error.what()).find("O_sparse is required"),
+              std::string::npos)
+        << error.what();
+  }
+}
+
+TEST(DecoderChunkFormTest, ResolveRejectsPriorsCompetingWithThePhases) {
+  // The parser rejects error_rate_vec for chunk form, but a config built
+  // through the API never sees that check, and the phases carry their own
+  // priors.
+  auto config = parse_one(dem_chunks_yaml(5));
+  config.error_rate_vec.assign(10, 0.01);
+
+  try {
+    cudaq::qec::decoding::host::resolve_decoder_init(
+        config, std::filesystem::current_path());
+    FAIL() << "expected a competing-priors rejection";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string(error.what()).find("error_rate_vec"),
+              std::string::npos)
+        << error.what();
+  }
+}
+
+TEST(DecoderChunkFormTest, ResolveNamesTheDecoderWhenExpansionFails) {
+  // Resolution catches this now that chunk form no longer passes through
+  // expand_dem_chunks(), and still has to say which decoder failed.
+  auto config = parse_one(dem_chunks_yaml(5));
+  ASSERT_TRUE(config.dem_chunks.has_value());
+  config.dem_chunks->num_rounds.reset();
+
+  try {
+    cudaq::qec::decoding::host::resolve_decoder_init(
+        config, std::filesystem::current_path());
+    FAIL() << "expected an unresolvable-round-count rejection";
+  } catch (const std::runtime_error &error) {
+    const std::string message = error.what();
+    EXPECT_NE(message.find("dem_chunks for decoder 0"), std::string::npos)
+        << message;
+    EXPECT_NE(message.find("num_rounds"), std::string::npos) << message;
+  }
+}
+
+TEST(DecoderChunkFormTest, ChunkSourcedDecoderDecodesLikeTheFlattenedPath) {
+  // sample_decoder returns a zero frame whatever its model says, so parity
+  // needs a decoder that reads H and O.
+  std::string yaml = dem_chunks_yaml(5);
+  const auto type_at = yaml.find("sample_decoder");
+  ASSERT_NE(type_at, std::string::npos);
+  yaml.replace(type_at, std::strlen("sample_decoder"), "multi_error_lut");
+
+  const auto chunk_config = parse_one(yaml);
+  auto flat_config = chunk_config;
+  const auto closed =
+      cudaq::qec::decoding::config::expand_dem_chunks(flat_config);
+  ASSERT_TRUE(closed.has_value());
+  // The flat keys carry no priors; supply them as a hand-written flat config
+  // would.
+  flat_config.error_rate_vec = closed->error_rates;
+
+  const std::filesystem::path cwd = std::filesystem::current_path();
+  auto chunk_inputs =
+      cudaq::qec::decoding::host::resolve_decoder_init(chunk_config, cwd);
+  auto flat_inputs =
+      cudaq::qec::decoding::host::resolve_decoder_init(flat_config, cwd);
+
+  EXPECT_EQ(chunk_inputs.source(),
+            cudaq::qec::decoder_model_source::dem_chunks);
+  EXPECT_EQ(flat_inputs.source(), cudaq::qec::decoder_model_source::matrices);
+  EXPECT_EQ(chunk_inputs.detector_error_matrix().to_csr().to_nested_csr(),
+            flat_inputs.detector_error_matrix().to_csr().to_nested_csr());
+  EXPECT_EQ(chunk_inputs.observable_flips_matrix().to_nested_csr(),
+            flat_inputs.observable_flips_matrix().to_nested_csr());
+  ASSERT_NE(chunk_inputs.measurement_to_detectors(), nullptr);
+  ASSERT_NE(flat_inputs.measurement_to_detectors(), nullptr);
+  EXPECT_EQ(chunk_inputs.measurement_to_detectors()->to_nested_csr(),
+            flat_inputs.measurement_to_detectors()->to_nested_csr());
+  EXPECT_EQ(chunk_inputs.error_rates(), flat_inputs.error_rates());
+
+  auto chunk_decoder = cudaq::qec::decoding::host::create_realtime_decoder(
+      chunk_config, chunk_inputs);
+  auto flat_decoder = cudaq::qec::decoding::host::create_realtime_decoder(
+      flat_config, flat_inputs);
+  for (std::uint32_t pattern = 0; pattern < 32u; ++pattern) {
+    std::vector<cudaq::qec::float_t> syndrome(5, 0.0);
+    for (std::size_t bit = 0; bit < syndrome.size(); ++bit)
+      syndrome[bit] = (pattern >> bit) & 1u ? 1.0 : 0.0;
+    EXPECT_EQ(chunk_decoder->decode(syndrome).result,
+              flat_decoder->decode(syndrome).result)
+        << "syndrome pattern " << pattern;
+  }
 }
 
 TEST(DecoderChunkFormTest, SameConnectionsDifferentRoundCounts) {

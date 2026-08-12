@@ -9,7 +9,9 @@
 #include "stim.h"
 #include "cudaq/qec/decoder.h"
 #include "cudaq/qec/decoder_init.h"
+#include "cudaq/qec/dem_chunks_memory.h"
 #include "cudaq/qec/detector_error_model.h"
+#include "cudaq/qec/extended_dem.h"
 #include "cudaq/qec/pcm_utils.h"
 #include <atomic>
 #include <cmath>
@@ -200,6 +202,173 @@ TEST(DecoderInputs, DerivationsKeepRawSourceAndFreshMatricesDoNot) {
       cudaq::qec::sparse_binary_matrix::from_nested_csr(0, 1, {}), {0.1});
   EXPECT_FALSE(reindexed.has_stim_dem());
   EXPECT_THROW((void)reindexed.stim_dem(), std::logic_error);
+}
+
+namespace {
+
+/// A d=5 repetition-code memory experiment in chunk form. The final phase uses
+/// a distinct prior so the concatenation order is observable.
+cudaq::qec::dem_chunks_spec rep_chunks_spec(std::uint64_t rounds = 5) {
+  cudaq::qec::dem_chunks_spec spec;
+  spec.seam = {cudaq::qec::seam_name::next_round,
+               cudaq::qec::seam_name::prev_round};
+  spec.connections = {
+      {cudaq::qec::phase_name::dem_init, cudaq::qec::phase_name::dem_bulk},
+      {cudaq::qec::phase_name::dem_bulk, cudaq::qec::phase_name::dem_bulk},
+      {cudaq::qec::phase_name::dem_bulk, cudaq::qec::phase_name::dem_final}};
+  spec.num_rounds = rounds;
+
+  cudaq::qec::dem_chunk_spec bulk;
+  bulk.num_faults = 9;
+  bulk.H_sparse = {0, 1, 5, -1, 1, 2, 6, -1, 2, 3, 7, -1, 3, 4, 8, -1};
+  bulk.O_sparse = {0, -1};
+  bulk.error_rates.assign(9, 0.02);
+
+  cudaq::qec::dem_chunk_spec last;
+  last.num_faults = 5;
+  last.H_sparse = {0, 1, -1, 1, 2, -1, 2, 3, -1, 3, 4, -1};
+  last.O_sparse = {0, -1};
+  last.error_rates.assign(5, 0.03);
+
+  spec.phases.push_back({cudaq::qec::phase_name::dem_init, bulk});
+  spec.phases.push_back({cudaq::qec::phase_name::dem_bulk, bulk});
+  spec.phases.push_back({cudaq::qec::phase_name::dem_final, last});
+  return spec;
+}
+
+std::vector<std::vector<std::uint32_t>>
+dense_rows(const cudaqx::tensor<std::uint8_t> &matrix) {
+  std::vector<std::vector<std::uint32_t>> rows(matrix.shape()[0]);
+  for (std::size_t r = 0; r < matrix.shape()[0]; ++r)
+    for (std::size_t c = 0; c < matrix.shape()[1]; ++c)
+      if (matrix.at({r, c}))
+        rows[r].push_back(static_cast<std::uint32_t>(c));
+  return rows;
+}
+
+} // namespace
+
+TEST(DecoderInputs, ChunksRemainAuthoritative) {
+  const auto spec = rep_chunks_spec();
+  auto inputs = cudaq::qec::decoder_init::from_dem_chunks(spec);
+
+  EXPECT_EQ(inputs.source(), cudaq::qec::decoder_model_source::dem_chunks);
+  ASSERT_TRUE(inputs.has_dem_chunks());
+  EXPECT_TRUE(inputs.dem_chunks() == spec);
+
+  // The expansion is kept too, so a chunk-consuming decoder need not redo it.
+  const auto *chunks = inputs.dem_chunk_sequence();
+  ASSERT_NE(chunks, nullptr);
+  EXPECT_EQ(chunks->size(), 5u);
+
+  // Priors come from the phases in chunk order: four nine-fault chunks, then
+  // the five-fault final one.
+  std::vector<double> expected_rates(36, 0.02);
+  expected_rates.insert(expected_rates.end(), 5, 0.03);
+  EXPECT_EQ(inputs.error_rates(), expected_rates);
+  EXPECT_EQ(inputs.num_error_mechanisms(), expected_rates.size());
+  EXPECT_EQ(inputs.num_observables(), 1u);
+
+  auto stim = cudaq::qec::decoder_init::from_stim_dem("error(0.1) D0 L0\n");
+  EXPECT_FALSE(stim.has_dem_chunks());
+  EXPECT_EQ(stim.dem_chunk_sequence(), nullptr);
+  EXPECT_THROW((void)stim.dem_chunks(), std::logic_error);
+}
+
+TEST(DecoderInputs, ChunkProjectionMatchesTheClosedModel) {
+  const auto spec = rep_chunks_spec();
+  auto inputs = cudaq::qec::decoder_init::from_dem_chunks(spec);
+
+  // Closing is the route the config layer used to take; projecting straight to
+  // sparse has to describe the same model, or a chunk-form configuration would
+  // decode differently than it did before.
+  const auto closed =
+      cudaq::qec::dem_close_all(cudaq::qec::dem_chunks_from_spec(spec),
+                                spec.seam.from_seam, spec.seam.to_seam);
+
+  EXPECT_EQ(inputs.num_detectors(), closed.num_detectors());
+  EXPECT_EQ(inputs.num_error_mechanisms(), closed.num_error_mechanisms());
+  EXPECT_EQ(inputs.detector_error_matrix().to_csr().to_nested_csr(),
+            dense_rows(closed.detector_error_matrix));
+  EXPECT_EQ(inputs.observable_flips_matrix().to_nested_csr(),
+            dense_rows(closed.observables_flips_matrix));
+  EXPECT_EQ(inputs.error_rates(), closed.error_rates);
+}
+
+TEST(DecoderInputs, ChunkDerivationsKeepTheChunkSource) {
+  const auto spec = rep_chunks_spec();
+  const auto chunks = cudaq::qec::dem_chunks_from_spec(spec);
+  const auto detector_rows = cudaq::qec::dem_chunks_to_d_sparse(
+      chunks, spec.seam.from_seam, spec.seam.to_seam);
+  std::uint32_t num_measurements = 0;
+  for (const auto &row : detector_rows)
+    for (auto column : row)
+      num_measurements = std::max(num_measurements, column + 1);
+
+  auto inputs = cudaq::qec::decoder_init::from_dem_chunks(
+      spec, chunks,
+      cudaq::qec::sparse_binary_matrix::from_nested_csr(
+          static_cast<std::uint32_t>(detector_rows.size()), num_measurements,
+          detector_rows));
+  ASSERT_NE(inputs.measurement_to_detectors(), nullptr);
+
+  // Both derivations copy the state; pointer identity is what rules out
+  // duplicating every round's matrices along with it.
+  auto without_d = inputs.decoder_init_without_d();
+  EXPECT_EQ(without_d.source(), cudaq::qec::decoder_model_source::dem_chunks);
+  EXPECT_TRUE(without_d.dem_chunks() == spec);
+  EXPECT_EQ(without_d.dem_chunk_sequence(), inputs.dem_chunk_sequence());
+  EXPECT_EQ(without_d.measurement_to_detectors(), nullptr);
+
+  auto canonical = inputs.canonicalize_H();
+  EXPECT_EQ(canonical.source(), cudaq::qec::decoder_model_source::dem_chunks);
+  EXPECT_TRUE(canonical.dem_chunks() == spec);
+  EXPECT_EQ(canonical.dem_chunk_sequence(), inputs.dem_chunk_sequence());
+  ASSERT_NE(canonical.measurement_to_detectors(), nullptr);
+  EXPECT_EQ(canonical.detector_error_matrix().num_cols(),
+            inputs.detector_error_matrix().num_cols());
+}
+
+TEST(DecoderInputs, ChunksWithoutObservablesSupplyNoObservableModel) {
+  // Phases with no observable rows are an H-only model. Reporting one anyway
+  // would let a decoder built for observable output construct and then return
+  // an empty frame.
+  auto spec = rep_chunks_spec();
+  for (auto &phase : spec.phases)
+    phase.spec.O_sparse.clear();
+
+  auto inputs = cudaq::qec::decoder_init::from_dem_chunks(spec);
+  EXPECT_EQ(inputs.source(), cudaq::qec::decoder_model_source::dem_chunks);
+  EXPECT_FALSE(inputs.has_observable_model());
+  EXPECT_EQ(inputs.num_observables(), 0u);
+  EXPECT_THROW((void)inputs.observable_flips_matrix(), std::logic_error);
+}
+
+TEST(DecoderInputs, SuppliedChunksMustMatchTheSpec) {
+  // Pairing a spec with an expansion of a different round count would leave
+  // dem_chunks() describing a different model than the projection.
+  const auto five = cudaq::qec::dem_chunks_from_spec(rep_chunks_spec(5));
+  EXPECT_THROW(
+      (void)cudaq::qec::decoder_init::from_dem_chunks(rep_chunks_spec(3), five),
+      std::invalid_argument);
+  EXPECT_NO_THROW((void)cudaq::qec::decoder_init::from_dem_chunks(
+      rep_chunks_spec(5), five));
+}
+
+TEST(DecoderInputs, StreamingChunkSpecIsRejected) {
+  // A spec that leaves the round count to the run has nothing to expand, and
+  // so no projection for the decoder base to size its buffers from.
+  const auto chunks = cudaq::qec::dem_chunks_from_spec(rep_chunks_spec());
+  auto spec = rep_chunks_spec();
+  spec.num_rounds.reset();
+  ASSERT_TRUE(spec.has_repeating_phase());
+
+  EXPECT_THROW((void)cudaq::qec::decoder_init::from_dem_chunks(spec),
+               std::invalid_argument);
+  // An expansion does not make the spec resolvable; the retained spec still
+  // could not say how many rounds it stands for.
+  EXPECT_THROW((void)cudaq::qec::decoder_init::from_dem_chunks(spec, chunks),
+               std::invalid_argument);
 }
 
 TEST(DecoderOutputContract, OutputFormIsImmutablePerInstance) {

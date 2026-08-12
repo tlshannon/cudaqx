@@ -9,6 +9,7 @@
 #include "realtime_decoding.h"
 #include "../hardware_guards.h"
 #include "cudaq/qec/decoder.h"
+#include "cudaq/qec/dem_chunks_memory.h"
 #include "cudaq/qec/logger.h"
 #include "cudaq/qec/pcm_utils.h"
 #include "cudaq/qec/realtime/decoding_config.h"
@@ -169,10 +170,33 @@ cudaqx::heterogeneous_map prepare_decoder_params(
 
 namespace {
 
-/// Build D in GF(2)-canonical form from the flat -1-terminated encoding. A
+/// Build D in GF(2)-canonical form from per-detector measurement index rows. A
 /// repeated index in a row cancels under the realtime detector XOR, so
 /// canonicalizing here puts that rule in the model rather than leaving each
 /// consumer to interpret duplicates its own way.
+cudaq::qec::sparse_binary_matrix canonical_detector_rows(
+    const std::vector<std::vector<std::uint32_t>> &detector_rows) {
+  // Width is taken before cancellation, so a trailing measurement referenced
+  // only by a cancelling pair still counts. The bound is enforced here rather
+  // than assumed of the caller, so column + 1 is always safe.
+  std::uint32_t num_measurements = 0;
+  for (const auto &r : detector_rows)
+    for (auto column : r) {
+      if (column == std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error(fmt::format(
+            "Measurement index in D is out of range: {} (the exclusive upper "
+            "bound must be representable)",
+            column));
+      num_measurements = std::max(num_measurements, column + 1);
+    }
+
+  return cudaq::qec::sparse_binary_matrix::from_nested_csr(
+             static_cast<std::uint32_t>(detector_rows.size()), num_measurements,
+             detector_rows)
+      .canonicalize();
+}
+
+/// Parse the flat -1-terminated D encoding, then build the canonical matrix.
 cudaq::qec::sparse_binary_matrix
 canonical_measurement_to_detectors(const std::vector<std::int64_t> &d_sparse) {
   std::vector<std::vector<std::uint32_t>> detector_rows;
@@ -202,18 +226,7 @@ canonical_measurement_to_detectors(const std::vector<std::int64_t> &d_sparse) {
   if (!row.empty())
     detector_rows.push_back(std::move(row));
 
-  // Width is taken before cancellation, so a trailing measurement referenced
-  // only by a cancelling pair still counts toward the per-decode width. The
-  // bound above makes column + 1 safe.
-  std::uint32_t num_measurements = 0;
-  for (const auto &r : detector_rows)
-    for (auto column : r)
-      num_measurements = std::max(num_measurements, column + 1);
-
-  return cudaq::qec::sparse_binary_matrix::from_nested_csr(
-             static_cast<std::uint32_t>(detector_rows.size()), num_measurements,
-             detector_rows)
-      .canonicalize();
+  return canonical_detector_rows(detector_rows);
 }
 
 void validate_sparse_indices(const std::vector<std::int64_t> &sparse,
@@ -223,6 +236,68 @@ void validate_sparse_indices(const std::vector<std::int64_t> &sparse,
         (value >= 0 && static_cast<std::uint64_t>(value) >= num_columns))
       throw std::runtime_error(
           fmt::format("Value in {} vector is out of range: {}", name, value));
+}
+
+/// Build a chunk-sourced handle from a chunk-form configuration.
+///
+/// The handle keeps the phases and derives H, O and priors itself. Only D is
+/// computed here: the memory experiment's XOR of consecutive rounds is a
+/// property of the circuit, not of the model.
+cudaq::qec::decoder_init resolve_chunk_decoder_init(
+    const cudaq::qec::decoding::config::decoder_config &decoder_config) {
+  const auto &spec = *decoder_config.dem_chunks;
+  const cudaq::qec::seam_id from_seam = spec.seam.from_seam;
+  const cudaq::qec::seam_id to_seam = spec.seam.to_seam;
+
+  // The phases carry a prior per fault, so a top-level vector could only be
+  // dropped. The YAML parser rejects it for chunk form; a config built through
+  // the API skips that check.
+  if (!decoder_config.error_rate_vec.empty())
+    throw std::runtime_error(
+        "error_rate_vec must not be set for decoder " +
+        std::to_string(decoder_config.id) +
+        " because it is derived from dem_chunks. Remove it, or describe the "
+        "whole experiment with H_sparse instead of dem_chunks.");
+
+  std::vector<cudaq::qec::extended_dem> chunks;
+  try {
+    chunks = cudaq::qec::dem_chunks_from_spec(spec);
+  } catch (const std::invalid_argument &error) {
+    throw std::runtime_error("Cannot expand dem_chunks for decoder " +
+                             std::to_string(decoder_config.id) + ": " +
+                             error.what());
+  }
+
+  std::vector<std::vector<std::uint32_t>> detector_rows;
+  try {
+    detector_rows =
+        cudaq::qec::dem_chunks_to_d_sparse(chunks, from_seam, to_seam);
+  } catch (const std::exception &error) {
+    throw std::runtime_error("Cannot close dem_chunks for decoder " +
+                             std::to_string(decoder_config.id) + ": " +
+                             error.what());
+  }
+
+  // Hand the expansion over rather than repeat it; deriving D above already
+  // cost one pass. Model validation lives in the handle, so its failures are
+  // re-thrown with the id, which "D row count must match H row count" lacks.
+  auto inputs = [&]() -> cudaq::qec::decoder_init {
+    try {
+      return cudaq::qec::decoder_init::from_dem_chunks(
+          spec, std::move(chunks), canonical_detector_rows(detector_rows));
+    } catch (const std::invalid_argument &error) {
+      throw std::runtime_error("Cannot build decoder " +
+                               std::to_string(decoder_config.id) +
+                               " from dem_chunks: " + error.what());
+    }
+  }();
+  // Same rule the matrix branch applies: this path returns observable
+  // corrections, so phases that flip no observable cannot serve it.
+  if (inputs.num_observables() == 0)
+    throw std::runtime_error(
+        "O_sparse is required: the decoding server constructs every decoder "
+        "for observable output, which needs an observable mapping");
+  return inputs;
 }
 
 void validate_detector_rows(const std::vector<std::int64_t> &d_sparse,
@@ -239,19 +314,13 @@ void validate_detector_rows(const std::vector<std::int64_t> &d_sparse,
 } // namespace
 
 cudaq::qec::decoder_init resolve_decoder_init(
-    const cudaq::qec::decoding::config::decoder_config &config_in,
+    const cudaq::qec::decoding::config::decoder_config &decoder_config,
     const std::filesystem::path &base_dir) {
-  // A chunk-form configuration names its DEM one round at a time. Expand it
-  // here so everything below is written against the flat form only.
-  auto expanded_config = config_in;
-  const auto closed_dem =
-      cudaq::qec::decoding::config::expand_dem_chunks(expanded_config);
-  // The phases carry a prior per fault, which the derived matrices do not.
-  // Supply them on the top-level error_rate_vec so decoder_init receives them
-  // the same way a hand-written flat configuration would.
-  if (closed_dem && expanded_config.error_rate_vec.empty())
-    expanded_config.error_rate_vec = closed_dem->error_rates;
-  const auto &decoder_config = expanded_config;
+  // A chunk-form configuration's rounds are what its model is, so they reach
+  // the handle intact rather than being flattened into matrix form on the way
+  // past.
+  if (decoder_config.dem_chunks.has_value() && decoder_config.H_sparse.empty())
+    return resolve_chunk_decoder_init(decoder_config);
 
   if (decoder_config.D_sparse.empty())
     throw std::runtime_error(
