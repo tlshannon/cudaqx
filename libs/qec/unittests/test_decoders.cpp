@@ -355,20 +355,33 @@ TEST(DecoderInputs, SuppliedChunksMustMatchTheSpec) {
       rep_chunks_spec(5), five));
 }
 
-TEST(DecoderInputs, StreamingChunkSpecIsRejected) {
-  // A spec that leaves the round count to the run has nothing to expand, and
-  // so no projection for the decoder base to size its buffers from.
-  const auto chunks = cudaq::qec::dem_chunks_from_spec(rep_chunks_spec());
+TEST(DecoderInputs, StreamingChunkSpecWithNoChunksIsRejected) {
+  // The no-arg path must expand the spec; without num_rounds it cannot, so it
+  // is rejected. The two-arg path accepts pre-supplied chunks (streaming).
   auto spec = rep_chunks_spec();
   spec.num_rounds.reset();
   ASSERT_TRUE(spec.has_repeating_phase());
 
   EXPECT_THROW((void)cudaq::qec::decoder_init::from_dem_chunks(spec),
                std::invalid_argument);
-  // An expansion does not make the spec resolvable; the retained spec still
-  // could not say how many rounds it stands for.
-  EXPECT_THROW((void)cudaq::qec::decoder_init::from_dem_chunks(spec, chunks),
-               std::invalid_argument);
+}
+
+TEST(DecoderInputs, StreamingChunkSpecWithChunksIsAccepted) {
+  // A streaming spec (repeating phase, no num_rounds) paired with pre-supplied
+  // chunks must construct successfully: the chunks are the window DEM and the
+  // spec records the structure for downstream consumers (e.g. sliding_window).
+  const auto chunks = cudaq::qec::dem_chunks_from_spec(rep_chunks_spec());
+  auto spec = rep_chunks_spec();
+  spec.num_rounds.reset();
+  ASSERT_TRUE(spec.has_repeating_phase());
+
+  auto inputs = cudaq::qec::decoder_init::from_dem_chunks(spec, chunks);
+
+  EXPECT_EQ(inputs.source(), cudaq::qec::decoder_model_source::dem_chunks);
+  ASSERT_TRUE(inputs.has_dem_chunks());
+  EXPECT_TRUE(inputs.dem_chunks() == spec);
+  ASSERT_NE(inputs.dem_chunk_sequence(), nullptr);
+  EXPECT_EQ(inputs.dem_chunk_sequence()->size(), chunks.size());
 }
 
 TEST(DecoderOutputContract, OutputFormIsImmutablePerInstance) {

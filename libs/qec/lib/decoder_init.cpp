@@ -104,13 +104,17 @@ std::shared_ptr<decoder_init::impl> decoder_init::make_chunk_state(
   // A supplied expansion has to be the one the spec describes, or the retained
   // spec would name a different model than the projection. Comparing lengths
   // catches the likely misuse: an expansion of a different round count.
-  require_resolvable_round_count(spec);
-  const auto sequence = spec.phase_sequence();
-  if (sequence.size() != chunks.size())
-    throw std::invalid_argument("decoder_init: dem_chunks spec describes " +
-                                std::to_string(sequence.size()) +
-                                " chunks but " + std::to_string(chunks.size()) +
-                                " were supplied");
+  // For a streaming spec (repeating phase, no num_rounds) the round count is
+  // open-ended by design; phase_sequence() would throw, so the check is skipped
+  // and the caller-supplied chunk count is accepted as-is.
+  if (!spec.has_repeating_phase() || spec.num_rounds.has_value()) {
+    const auto sequence = spec.phase_sequence();
+    if (sequence.size() != chunks.size())
+      throw std::invalid_argument(
+          "decoder_init: dem_chunks spec describes " +
+          std::to_string(sequence.size()) + " chunks but " +
+          std::to_string(chunks.size()) + " were supplied");
+  } // end - if(spec resolvable)
 
   // Project straight to sparse, as from_stim_dem() does: closing the chunks
   // would allocate a dense detector x fault tensor for a model whose sparse
